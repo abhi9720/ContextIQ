@@ -6,41 +6,104 @@ This document outlines the architecture of the RAG application, detailing the in
 ## Mermaid Diagram
 
 ```mermaid
-graph TD
-    subgraph "Ingestion Pipeline (/embed)"
-        direction LR
-        A["POST /embed <br> (file, metadata)"] --> B{"embed"};
-        B --> C["validate_file"];
-        C --> D["save_raw_file"];
-        D --> E["extract_and_chunk_file"];
-        E --> F["add_document"];
-        E --> G{"For each chunk"};
-        G --> H["preprocess_text"];
-        H --> I["generate_metadata"];
-        I --> J["embed_and_store"];
-    end
+---
+config:
+  layout: dagre
+---
+flowchart TB
+ subgraph Ingestion_Pipeline["Ingestion Pipeline"]
+    direction TB
+        B{{"File Validation"}}
+        A[/"User Uploads Document"/]
+        C["Store Raw File (uploads/)"]
+        D["Extract Text"]
+        E["Chunk Text"]
+        F["Generate Chunk Metadata"]
+        G["Generate Embeddings"]
+        H["Store in Vector DB"]
+        I["Store Metadata"]
+  end
+ subgraph Retrieval_Pipeline["Retrieval Pipeline"]
+    direction TB
+        K{{"Query Safety Filter"}}
+        J[/"User Query"/]
+        L{{"Query Validation"}}
+        M["Query Embedding Generation"]
+        N["Vector Search"]
+        O["Re-ranking"]
+        P["Assemble & Compress Context"]
+        Q["Enhance Context"]
+        R["Compose Prompt"]
+        S["LLM Invocation (Gemini)"]
+        T["Enhance Response"]
+        U[/"Return Answer to User"/]
+  end
+ subgraph Shared_Resources["Shared Storage / DB"]
+    direction TB
+        V["ChromaDB Vector Store"]
+        W["Document Metadata Store (SQLite / MongoDB)"]
+  end
+ subgraph Feedback_Pipeline["Feedback Pipeline"]
+    direction TB
+        Y["Store Feedback"]
+        X[/"User Feedback"/]
+  end
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G & I
+    G --> H
+    J --> K
+    K --> L
+    L --> M
+    M --> N
+    N --> O & V
+    O --> P & W
+    P --> Q
+    Q --> R
+    R --> S
+    S --> T
+    T --> U
+    H --> V
+    I --> W
+    X --> Y
+    Y --- O
+    U --> X
 
-    subgraph "Retrieval Pipeline (/retrieve)"
-        direction LR
-        K["POST /retrieve <br> (query, k)"] --> L{"retrieve_v1"};
-        L --> M["filter_safety"];
-        M --> N["validate_query"];
-        N --> O["retrieve"];
-        O --> P["rerank_results"];
-        P --> Q["assemble_context"];
-        Q --> R["compress_context"];
-        R --> S["enhance_context"];
-        S --> T["compose_prompt"];
-        T --> U["invoke_llm"];
-        U --> V["enhance_response"];
-        V --> W["Response <br> (answer, sources)"];
-    end
-
-    subgraph "Feedback Pipeline (/api/v1/feedback)"
-        direction LR
-        X["POST /api/v1/feedback <br> (doc_id, rating)"] --> Y{"feedback_v1"};
-        Y --> Z["add_feedback"];
-    end
+     B:::validation
+     A:::user
+     C:::storage
+     D:::process
+     E:::process
+     F:::process
+     G:::process
+     H:::vector
+     I:::metadata
+     K:::validation
+     J:::user
+     L:::validation
+     M:::process
+     N:::vector
+     O:::process
+     P:::process
+     Q:::process
+     R:::process
+     S:::llm
+     T:::process
+     U:::user
+     V:::vector
+     W:::metadata
+     Y:::metadata
+     X:::user
+    classDef user fill:#FFD966,stroke:#333,stroke-width:1px
+    classDef validation fill:#FFABAB,stroke:#333,stroke-width:1px
+    classDef storage fill:#A0C4FF,stroke:#333,stroke-width:1px
+    classDef process fill:#B5EAEA,stroke:#333,stroke-width:1px
+    classDef vector fill:#CDB4DB,stroke:#333,stroke-width:1px
+    classDef metadata fill:#FFDAC1,stroke:#333,stroke-width:1px
+    classDef llm fill:#FF9CEE,stroke:#333,stroke-width:1px
 ```
 
 ## Detailed Flow Descriptions
