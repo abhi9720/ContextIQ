@@ -1,0 +1,32 @@
+gitignore
+# Python
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+env/
+venv/
+/tmp/
+
+# IDE specific files
+.vscode/
+.idea/
+
+# macOS specific
+.DS_Store
+
+# AI exclusion file
+.aiexclude
+
+# Temporary files and backups
+*~
+*.bak
+*.swp
+*.tmp
+*.bin
+.env
