@@ -1,37 +1,27 @@
 
 from dotenv import load_dotenv
-load_dotenv() # Must be called before any other imports that need environment variables
+load_dotenv()
 
 import os
 import uuid
 import json
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-import uvicorn
-from .pipeline.ingestion.file_processor import extract_and_chunk_file
-from .stores.vector_store import embed_and_store, retrieve
+import asyncio
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List
-from prometheus_fastapi_instrumentator import Instrumentator
-from prometheus_client import Gauge
-import time
-from .stores.metadata_store import MetadataStore
-import logging
 
-# Import pipeline modules
-from .pipeline.ingestion import validator as ingestion_validator
-from .pipeline.ingestion import preprocessor as ingestion_preprocessor
-from .pipeline.ingestion import metadata_generator as ingestion_metadata_generator
+from .stores.metadata_store import MetadataStore
+from .stores.vector_store import embed_and_store, retrieve
+from .pipeline.ingestion.file_processor import extract_and_chunk_file
 from .pipeline.ingestion import storage as ingestion_storage
-from .pipeline.retrieval import query_validator as retrieval_query_validator
-from .pipeline.retrieval import ranker as retrieval_ranker
-from .pipeline.retrieval import prompt_manager as retrieval_prompt_manager
-from .pipeline.retrieval import response_enhancer as retrieval_response_enhancer
-from .pipeline.retrieval.context_assembler import assemble_context
-from .pipeline.shared.optimizer import compress_context
-from .pipeline.llm.context_enhancer import enhance_context
-from .pipeline.llm.safety_filter import filter_safety
+from .pipeline.ingestion import validator as ingestion_validator
 from .pipeline.llm.prompt_composer import compose_prompt
 from .pipeline.llm.llm_invoker import invoke_llm
+from .pipeline.retrieval.context_assembler import assemble_context
+
+import logging
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -40,142 +30,372 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 metadata_store = MetadataStore()
 
-# Instrument the app with default metrics.
-instrumentator = Instrumentator().instrument(app)
-instrumentator.expose(app)
+# Background executor for processing-intensive tasks
+executor = ThreadPoolExecutor(max_workers=os.cpu_count())
+loop = asyncio.get_event_loop()
 
-# Custom metrics
-retrieval_latency_gauge = Gauge('retrieval_latency_ms', 'Retrieval latency in milliseconds')
-avg_top_k_score_gauge = Gauge('avg_top_k_score', 'Average top-k score')
+# --- Request/Response Models ---
 
-class RetrieveRequest(BaseModel):
-    query: str
-    k: int = Field(5, ge=1, le=100)
-
-class RetrieveResponse(BaseModel):
-    answer: str
-    sources: List[Dict]
-
-class FeedbackRequest(BaseModel):
+class DocumentMetadata(BaseModel):
     doc_id: str
-    rating: int = Field(..., ge=-1, le=1, description="-1 for downvote, 1 for upvote")
+    filename: str
+    status: str
+    quality_score: int
 
-@app.post("/embed")
-async def embed(file: UploadFile = File(...), metadata: Optional[str] = Form(None)):
-    """Orchestrates the document ingestion pipeline."""
-    logger.info(f"Starting ingestion for file: {file.filename}")
+class DocumentListResponse(BaseModel):
+    documents: List[DocumentMetadata]
+
+class DocumentUploadResponse(BaseModel):
+    doc_id: str
+    status: str
+
+class QuizRequest(BaseModel):
+    difficulty: str = Field("medium", description="Difficulty of the quiz")
+    question_count: int = Field(5, ge=1, le=20, description="Number of questions")
+    question_types: List[str] = Field(["multiple-choice"], description="Types of questions")
+    topics: Optional[List[str]] = Field(None, description="Optional topics to focus on")
+
+class QuizCreateResponse(BaseModel):
+    quiz_id: str
+    status: str
+
+class QuizStatusResponse(BaseModel):
+    quiz_id: str
+    status: str
+    questions: Optional[List[Dict]] = None
+
+class FlashcardRequest(BaseModel):
+    count: int = Field(10, ge=1, le=50, description="Number of flashcards")
+
+class FlashcardCreateResponse(BaseModel):
+    flashcards_id: str
+    status: str
+
+class FlashcardStatusResponse(BaseModel):
+    flashcards_id: str
+    status: str
+    flashcards: Optional[List[Dict]] = None
+
+# --- Background Processing Functions ---
+
+def process_document_background(doc_id: str):
+    """Background task to process a single document."""
+    try:
+        doc_info = metadata_store.get_document(doc_id)
+        if not doc_info:
+            logger.error(f"[Worker] Document {doc_id} not found.")
+            return
+
+        logger.info(f"[Worker] Starting processing for document: {doc_id}")
+        metadata_store.update_document_status(doc_id, "PROCESSING")
+
+        # 1. Extract and chunk file
+        with open(doc_info['file_path'], 'rb') as f:
+            temp_upload_file = UploadFile(filename=doc_info['filename'], file=f)
+            chunks = asyncio.run(extract_and_chunk_file(temp_upload_file))
+
+        if not chunks:
+            metadata_store.update_document_status(doc_id, "FAILED")
+            logger.error(f"[Worker] Failed to extract chunks from {doc_id}.")
+            return
+
+        # 2. Store chunks and generate embeddings
+        for chunk in chunks:
+            chunk_id = f"{doc_id}_{chunk['paragraph_id']}"
+            chunk_metadata = {
+                "doc_id": doc_id,
+                "source": doc_info['filename'],
+                "paragraph_id": chunk["paragraph_id"],
+            }
+            embed_and_store(chunk['text'], chunk_metadata, chunk_id)
+
+        metadata_store.add_chunks(doc_id, chunks)
+        metadata_store.update_document_status(doc_id, "PROCESSED")
+        logger.info(f"[Worker] Successfully processed document: {doc_id}")
+
+    except Exception as e:
+        metadata_store.update_document_status(doc_id, "FAILED")
+        logger.error(f"[Worker] Error processing document {doc_id}: {e}", exc_info=True)
+
+def generate_quiz_background(quiz_id: str):
+    """Background task to generate a quiz."""
+    logger.debug(f"[QuizWorker] Starting quiz generation for quiz_id: {quiz_id}")
+    try:
+        quiz_info = metadata_store.get_quiz(quiz_id)
+        if not quiz_info:
+            logger.error(f"[QuizWorker] Quiz {quiz_id} not found.")
+            return
+        
+        logger.debug(f"[QuizWorker] Quiz info retrieved: {quiz_info}")
+        doc_id = quiz_info['doc_id']
+        logger.info(f"[QuizWorker] Starting quiz generation for quiz_id: {quiz_id} on doc: {doc_id}")
+
+        logger.debug("[QuizWorker] Retrieving context from vector store...")
+        retrieved_results = retrieve(query="", k=10, filter={"doc_id": doc_id})
+        logger.debug(f"[QuizWorker] Retrieved results: {retrieved_results}")
+
+        if not retrieved_results.get('results'):
+            logger.error("[QuizWorker] No results retrieved from vector store. Aborting.")
+            metadata_store.update_quiz_status(quiz_id, "FAILED")
+            return
+            
+        logger.debug("[QuizWorker] Assembling context...")
+        context_chunks = assemble_context(retrieved_results)
+        context = "\n\n---\n\n".join(context_chunks)
+        logger.debug(f"[QuizWorker] Assembled context: {context}")
+
+        logger.debug("[QuizWorker] Composing prompt...")
+        prompt = compose_prompt(
+            context,
+            f"Generate a {quiz_info['request_params']['difficulty']} quiz with {quiz_info['request_params']['question_count']} questions in JSON format."
+        )
+        logger.debug(f"[QuizWorker] Composed prompt: {prompt}")
+
+        logger.debug("[QuizWorker] Invoking LLM...")
+        llm_response_str = invoke_llm(prompt)
+        logger.debug(f"[QuizWorker] LLM response: {llm_response_str}")
+        
+        try:
+            logger.debug("[QuizWorker] Cleaning and parsing LLM response...")
+            if llm_response_str.startswith("```json"):
+                llm_response_str = llm_response_str[7:]
+            if llm_response_str.endswith("```"):
+                llm_response_str = llm_response_str[:-3]
+            
+            data = json.loads(llm_response_str)
+
+            questions = None
+            if isinstance(data, list):
+                questions = data
+            elif isinstance(data, dict):
+                questions = data.get("quiz")
+
+            if not isinstance(questions, list):
+                logger.error("[QuizWorker] 'quiz' key not found or is not a list in LLM response.")
+                raise ValueError("'quiz' key not found or is not a list.")
+
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"[QuizWorker] Failed to parse or validate LLM response: {e}")
+            metadata_store.update_quiz_status(quiz_id, "FAILED")
+            return
+
+        logger.debug("[QuizWorker] Updating quiz status to READY...")
+        metadata_store.update_quiz_status(quiz_id, "READY", questions=questions)
+        logger.info(f"[QuizWorker] Successfully generated quiz: {quiz_id}")
+
+    except Exception as e:
+        logger.error(f"[QuizWorker] An unexpected error occurred: {e}", exc_info=True)
+        metadata_store.update_quiz_status(quiz_id, "FAILED")
+        logger.error(f"[QuizWorker] Error generating quiz {quiz_id}: {e}", exc_info=True)
+
+def generate_flashcards_background(flashcards_id: str):
+    """Background task to generate flashcards."""
+    logger.debug(f"[FlashcardWorker] Starting flashcard generation for flashcards_id: {flashcards_id}")
+    try:
+        flashcards_info = metadata_store.get_flashcards(flashcards_id)
+        if not flashcards_info:
+            logger.error(f"[FlashcardWorker] Flashcards {flashcards_id} not found.")
+            return
+        
+        logger.debug(f"[FlashcardWorker] Flashcards info retrieved: {flashcards_info}")
+        doc_id = flashcards_info['doc_id']
+        logger.info(f"[FlashcardWorker] Starting flashcard generation for flashcards_id: {flashcards_id} on doc: {doc_id}")
+
+        logger.debug("[FlashcardWorker] Retrieving context from vector store...")
+        retrieved_results = retrieve(query="", k=10, filter={"doc_id": doc_id})
+        logger.debug(f"[FlashcardWorker] Retrieved results: {retrieved_results}")
+
+        if not retrieved_results.get('results'):
+            logger.error("[FlashcardWorker] No results retrieved from vector store. Aborting.")
+            metadata_store.update_flashcards_status(flashcards_id, "FAILED")
+            return
+            
+        logger.debug("[FlashcardWorker] Assembling context...")
+        context_chunks = assemble_context(retrieved_results)
+        context = "\n\n---\n\n".join(context_chunks)
+        logger.debug(f"[FlashcardWorker] Assembled context: {context}")
+
+        logger.debug("[FlashcardWorker] Composing prompt...")
+        prompt = compose_prompt(
+            context,
+            f"Generate {flashcards_info['request_params']['count']} flashcards in JSON format. Each flashcard should have a 'front' and a 'back'."
+        )
+        logger.debug(f"[FlashcardWorker] Composed prompt: {prompt}")
+
+        logger.debug("[FlashcardWorker] Invoking LLM...")
+        llm_response_str = invoke_llm(prompt)
+        logger.debug(f"[FlashcardWorker] LLM response: {llm_response_str}")
+        
+        try:
+            logger.debug("[FlashcardWorker] Cleaning and parsing LLM response...")
+            # Clean the response string
+            if llm_response_str.startswith("```json"):
+                llm_response_str = llm_response_str[7:]
+            if llm_response_str.endswith("```"):
+                llm_response_str = llm_response_str[:-3]
+            
+            data = json.loads(llm_response_str)
+
+            flashcards = None
+            if isinstance(data, list):
+                flashcards = data
+            elif isinstance(data, dict):
+                flashcards = data.get("flashcards")
+
+            if not isinstance(flashcards, list):
+                logger.error("[FlashcardWorker] 'flashcards' key not found or is not a list in LLM response.")
+                raise ValueError("'flashcards' key not found or is not a list.")
+
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"[FlashcardWorker] Failed to parse or validate LLM response: {e}")
+            metadata_store.update_flashcards_status(flashcards_id, "FAILED")
+            return
+
+        logger.debug("[FlashcardWorker] Updating flashcards status to READY...")
+        metadata_store.update_flashcards_status(flashcards_id, "READY", flashcards=flashcards)
+        logger.info(f"[FlashcardWorker] Successfully generated flashcards: {flashcards_id}")
+
+    except Exception as e:
+        logger.error(f"[FlashcardWorker] An unexpected error occurred: {e}", exc_info=True)
+        metadata_store.update_flashcards_status(flashcards_id, "FAILED")
+        logger.error(f"[FlashcardWorker] Error generating flashcards {flashcards_id}: {e}", exc_info=True)
+
+
+async def poll_for_uploaded_documents():
+    """Periodically polls the metadata store for documents with 'UPLOADED' status."""
+    while True:
+        try:
+            uploaded_docs = metadata_store.get_documents_by_status('UPLOADED')
+            if uploaded_docs:
+                logger.info(f"[PollingWorker] Found {len(uploaded_docs)} documents to process.")
+                for doc in uploaded_docs:
+                    # Use the executor to run the synchronous processing function in a separate thread
+                    loop.run_in_executor(executor, process_document_background, doc['doc_id'])
+        except Exception as e:
+            logger.error(f"[PollingWorker] Error polling for documents: {e}", exc_info=True)
+        await asyncio.sleep(10) # Poll every 10 seconds
+
+@app.on_event("startup")
+async def startup_event():
+    """On application startup, starts the background polling worker."""
+    logger.info("Application starting up. Initializing background worker.")
+    asyncio.create_task(poll_for_uploaded_documents())
+
+# --- API Endpoints ---
+
+@app.get("/documents", response_model=DocumentListResponse)
+def get_documents(
+    session_id: Optional[str] = Header(None)
+):
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id header is required.")
+    
+    user_docs = metadata_store.get_documents_by_session(session_id)
+    
+    return {"documents": [
+        DocumentMetadata(
+            doc_id=doc['doc_id'], 
+            filename=doc['filename'], 
+            status=doc['status'],
+            quality_score=doc['quality_score']
+        ) for doc in user_docs
+    ]}
+
+@app.post("/documents", response_model=DocumentUploadResponse)
+async def upload_document(
+    file: UploadFile = File(...), 
+    session_id: Optional[str] = Header(None)
+):
     ingestion_validator.validate_file(file)
-    logger.debug("File validation successful.")
-
+    
     upload_dir = "uploads"
-    if not os.path.exists(upload_dir):
-        os.makedirs(upload_dir)
-    file_path = os.path.join(upload_dir, file.filename)
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    doc_id = str(uuid.uuid4())
+    file_path = os.path.join(upload_dir, f"{doc_id}_{file.filename}")
     
     await file.seek(0)
     ingestion_storage.save_raw_file(file, file_path)
-    logger.debug(f"File saved to: {file_path}")
-    await file.seek(0)
-
-    chunks = await extract_and_chunk_file(file)
-    doc_id = str(uuid.uuid4())
-    metadata_store.add_document(doc_id, file.filename, file_path)
-    logger.info(f"Generated doc_id: {doc_id} for file: {file.filename}")
-
-    doc_level_metadata = {}
-    if metadata:
-        doc_level_metadata = json.loads(metadata)
-    doc_level_metadata['source'] = file.filename
-    doc_level_metadata['doc_id'] = doc_id
-    logger.debug(f"Document level metadata: {doc_level_metadata}")
-
-    chunk_ids = []
-    for chunk in chunks:
-        preprocessed_text = ingestion_preprocessor.preprocess_text(chunk['text'])
-        generated_metadata = ingestion_metadata_generator.generate_metadata(preprocessed_text)
-
-        chunk_id = f"{doc_id}_{chunk['paragraph_id']}"
-        chunk_ids.append(chunk_id)
-        
-        chunk_metadata = doc_level_metadata.copy()
-        chunk_metadata.update({
-            "paragraph_id": chunk["paragraph_id"],
-            "start_offset": chunk["start_offset"],
-            "end_offset": chunk["end_offset"],
-            "generated_metadata": json.dumps(generated_metadata)
-        })
-        
-        embed_and_store(preprocessed_text, chunk_metadata, chunk_id)
-        logger.debug(f"Embedded and stored chunk: {chunk_id}")
-        
-    logger.info(f"Successfully ingested file: {file.filename}, with {len(chunks)} chunks.")
-    return {"filename": file.filename, "doc_id": doc_id, "num_chunks": len(chunks)}
-
-
-@app.post("/retrieve", response_model=RetrieveResponse)
-def retrieve_v1(request: RetrieveRequest):
-    """Orchestrates the retrieval and generation pipeline."""
-    logger.info(f"Received retrieval request with query: '{request.query}' and k: {request.k}")
-    safe_query = filter_safety(request.query, method='redact')
-    retrieval_query_validator.validate_query(safe_query)
-    logger.debug("Query validation successful.")
-
-    start_time = time.time()
-    retrieved_results = retrieve(safe_query, request.k)
-    end_time = time.time()
-    retrieval_latency = (end_time - start_time) * 1000
-    retrieval_latency_gauge.set(retrieval_latency)
-    logger.info(f"Retrieval latency: {retrieval_latency:.2f} ms")
-    logger.debug(f"Retrieved results: {retrieved_results}")
-
-    if retrieved_results and retrieved_results.get('results'):
-        top_k_scores = [r.get('score', 0) for r in retrieved_results['results']]
-        avg_top_k_score = sum(top_k_scores) / len(top_k_scores) if top_k_scores else 0
-        avg_top_k_score_gauge.set(avg_top_k_score)
-        logger.debug(f"Average top-k score: {avg_top_k_score}")
-
-    # Add the query to the results object for the reranker to use.
-    retrieved_results["query"] = safe_query
-    reranked_results = retrieval_ranker.rerank_results(retrieved_results)
-    logger.debug(f"Reranked results: {reranked_results}")
-
-    context_chunks = assemble_context(reranked_results)
-    compressed_chunks = compress_context(context_chunks, safe_query)
-    context = "\n\n---\n\n".join(compressed_chunks)
-    logger.debug(f"Assembled and compressed context: {context}")
     
-    metadata = [result['metadata'] for result in reranked_results.get('results', [])]
-    enhanced_context = enhance_context(context, metadata)
-    logger.debug(f"Enhanced context: {enhanced_context}")
+    metadata_store.add_document(doc_id, file.filename, file_path, session_id)
     
-    prompt = compose_prompt(enhanced_context, safe_query)
-    logger.debug(f"Composed prompt: {prompt}")
+    logger.info(f"Document {doc_id} uploaded. Worker will pick it up for processing.")
+    return {"doc_id": doc_id, "status": "UPLOADED"}
 
-    answer = invoke_llm(prompt)
-    logger.info("LLM invoked.")
-    logger.debug(f"LLM response: {answer}")
+@app.post("/documents/{doc_id}/quiz", response_model=QuizCreateResponse)
+def create_quiz_job(
+    doc_id: str,
+    request: QuizRequest,
+    background_tasks: BackgroundTasks,
+):
+    doc_info = metadata_store.get_document(doc_id)
+    if not doc_info:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    
+    if doc_info['status'] != "PROCESSED":
+        raise HTTPException(status_code=400, detail=f"Document status is '{doc_info['status']}', not 'PROCESSED'.")
 
-    sources = [
-        {"source": result['metadata'].get('source'), "doc_id": result['metadata'].get('doc_id')}
-        for result in reranked_results.get('results', [])
-    ]
-    unique_sources = [dict(t) for t in {tuple(d.items()) for d in sources}]
-    logger.debug(f"Sources: {unique_sources}")
+    request_hash = hashlib.sha256(json.dumps(request.dict(), sort_keys=True).encode()).hexdigest()
+    quiz_id = f"quiz_{doc_id}_{request_hash}"
 
-    enhanced_response = retrieval_response_enhancer.enhance_response(answer, unique_sources)
-    logger.info("Response enhanced.")
-    return enhanced_response
+    existing_quiz = metadata_store.get_quiz(quiz_id)
+    if existing_quiz:
+        return {"quiz_id": quiz_id, "status": existing_quiz['status']}
 
+    metadata_store.create_quiz(quiz_id, doc_id, request.dict())
+    background_tasks.add_task(generate_quiz_background, quiz_id)
+    
+    return {"quiz_id": quiz_id, "status": "GENERATING"}
 
-@app.post("/api/v1/feedback")
-def feedback_v1(request: FeedbackRequest):
-    """
-    Receives user feedback and updates the document's quality score.
-    """
-    logger.info(f"Received feedback for doc_id: {request.doc_id}, rating: {request.rating}")
-    metadata_store.add_feedback(request.doc_id, request.rating)
-    return {"status": "success", "doc_id": request.doc_id, "rating": request.rating}
+@app.get("/quiz/{quiz_id}/status", response_model=QuizStatusResponse)
+def get_quiz_status(quiz_id: str):
+    quiz_info = metadata_store.get_quiz(quiz_id)
+    if not quiz_info:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+        
+    return {
+        "quiz_id": quiz_id,
+        "status": quiz_info['status'],
+        "questions": quiz_info.get('questions') if quiz_info['status'] == "READY" else None
+    }
 
+@app.post("/documents/{doc_id}/flashcards", response_model=FlashcardCreateResponse)
+def create_flashcards_job(
+    doc_id: str,
+    request: FlashcardRequest,
+    background_tasks: BackgroundTasks,
+):
+    doc_info = metadata_store.get_document(doc_id)
+    if not doc_info:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    
+    if doc_info['status'] != "PROCESSED":
+        raise HTTPException(status_code=400, detail=f"Document status is '{doc_info['status']}', not 'PROCESSED'.")
+
+    request_hash = hashlib.sha256(json.dumps(request.dict(), sort_keys=True).encode()).hexdigest()
+    flashcards_id = f"flashcards_{doc_id}_{request_hash}"
+
+    existing_flashcards = metadata_store.get_flashcards(flashcards_id)
+    if existing_flashcards:
+        return {"flashcards_id": flashcards_id, "status": existing_flashcards['status']}
+
+    metadata_store.create_flashcards(flashcards_id, doc_id, request.dict())
+    background_tasks.add_task(generate_flashcards_background, flashcards_id)
+    
+    return {"flashcards_id": flashcards_id, "status": "GENERATING"}
+
+@app.get("/flashcards/{flashcards_id}/status", response_model=FlashcardStatusResponse)
+def get_flashcards_status(flashcards_id: str):
+    flashcards_info = metadata_store.get_flashcards(flashcards_id)
+    if not flashcards_info:
+        raise HTTPException(status_code=404, detail="Flashcards not found.")
+        
+    return {
+        "flashcards_id": flashcards_id,
+        "status": flashcards_info['status'],
+        "flashcards": flashcards_info.get('flashcards') if flashcards_info['status'] == "READY" else None
+    }
 
 if __name__ == "__main__":
-  uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))

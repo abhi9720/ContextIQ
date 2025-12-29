@@ -30,3 +30,4 @@ venv/
 *.tmp
 *.bin
 .env
+*.txt

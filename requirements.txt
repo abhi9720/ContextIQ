@@ -12,3 +12,5 @@ sentence-transformers
 chromadb
 docx2txt
 pypdf
+gradio
+requests

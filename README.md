@@ -5,124 +5,11 @@ This document provides a technical overview of the RAG system, a FastAPI-based a
 
 ## Overview
 
-The system is designed to be a modular and extensible platform for building and deploying RAG applications. It consists of two main pipelines: an ingestion pipeline for processing and embedding documents, and a retrieval pipeline for answering user queries.
+The system is designed to be a modular and extensible platform for building and deploying RAG applications. It consists of three main pipelines: an ingestion pipeline for processing and embedding documents, a retrieval pipeline for answering user queries, and a feedback pipeline for collecting user feedback.
 
 ## System Architecture
 
-The application is divided into three main layers: the API layer, the pipeline layer, and the storage layer.
-
-```mermaid
---- 
-config: 
-  theme: base
-  layout: fixed
---- 
-flowchart TD
-
-%% ======================= CLIENT LAYER =======================
-subgraph CLIENT["🧑‍💻 Client Applications"]
-  WebApp["Web / Mobile / Admin UI"]
-  UploadModule["Document Upload / Sync Module"]
-  ChatModule["Chat + Search Interface"]
-  Dashboard["Admin Dashboard (Monitor & Manage Docs)"]
-end
-
-%% ======================= BACKEND LAYER =======================
-subgraph BACKEND["🌐 Backend API (FastAPI / Flask)"]
-
-  %% -------- DOCUMENT INGESTION PIPELINE --------
-  subgraph INGESTION["📥 Document Ingestion Pipeline"]
-    FileUploadAPI["POST /embed → Upload Document"]
-    FileValidator["Validator → Type, Size, Integrity"]
-    SourceRouter["Source Router → File / URL / API / Stream"]
-    TextExtractor["Text Extractor → PDF, DOCX, HTML, Email"]
-    TextPreprocessor["Text Preprocessor → Cleanup, Normalize, Lemmatize"]
-    Chunker["Chunker → Token / Paragraph Split + Overlap"]
-    MetadataGenerator["Metadata Generator → Title, Author, Tags"]
-    EmbeddingClient["Embedding Model Client → SentenceTransformer / OpenAI"]
-    ChromaWriter["Chroma Client → Upsert Vectors + Metadata"]
-    MetadataWriter["Metadata Writer → MongoDB / Postgres"]
-    FileStorageWriter["Blob Storage Writer → S3 / NFS / Local Disk"]
-  end
-
-  %% -------- RETRIEVAL PIPELINE --------
-  subgraph RETRIEVAL["🔍 Retrieval & Query Pipeline"]
-    QueryAPI["POST /retrieve → Semantic Search"]
-    QueryValidator["Query Validator → Length, Language, Safety"]
-    QueryEmbedder["Query Embedder → Same Model as Document Embeddings"]
-    VectorRetriever["Vector Search → Chroma (Cosine Similarity)"]
-    ResultRanker["Re-ranker → Cross-Encoder / BGE / Score Normalizer"]
-    ContextAssembler["Context Assembler → Merge + Deduplicate"]
-    ContextCompressor["Context Compressor → Token Optimization"]
-    MetadataFetcher["Metadata Fetcher → Title, Source, Timestamp"]
-  end
-
-  %% -------- LLM ORCHESTRATION --------
-  subgraph LLM_FLOW["🧠 LLM Orchestration & Response Generation"]
-    PromptTemplateManager["Prompt Template Manager → Q&A / Summary / Search"]
-    ContextEnhancer["Context Enhancer → Add Metadata + Highlights"]
-    SafetyFilter["Safety Filter → Sensitive Data Masking"]
-    PromptComposer["Prompt Composer → Build Final System + User Prompt"]
-    LLMInvoker["LLM Connector → Gemini / GPT / Claude"]
-    ResponseParser["Response Parser → Structured / Plain Text"]
-    ResponseEnhancer["Response Enhancer → Formatting + Source Linking"]
-    FeedbackHandler["Feedback Collector → User Ratings + Corrections"]
-  end
-end
-
-%% ======================= STORAGE LAYER =======================
-subgraph STORAGE["🗂️ Storage & Database Layer"]
-  ChromaDB["ChromaDB → Vector Store"]
-  MongoDB["MongoDB / Postgres → Metadata + User Data"]
-  BlobStorage["S3 / NFS / Local Disk → Raw Documents"]
-end
-
-%% ======================= MODEL LAYER =======================
-subgraph MODEL["🤖 Models"]
-  EmbedModel["Embedding Model → text-embedding-3-small / all-MiniLM-L6-v2"]
-  LLM["LLM → Gemini / GPT-4 / Claude"]
-end
-
-
-%% ======================= DATA FLOWS =======================
-
-%% ---- Ingestion Flow ----
-WebApp -->|Uploads / Syncs Documents| UploadModule
-UploadModule --> FileUploadAPI
-FileUploadAPI --> FileValidator
-FileValidator --> SourceRouter
-SourceRouter --> TextExtractor
-TextExtractor --> TextPreprocessor
-TextPreprocessor --> Chunker
-Chunker --> MetadataGenerator
-MetadataGenerator --> EmbeddingClient
-EmbeddingClient -->|Generate Vector Embeddings| ChromaWriter
-ChromaWriter -->|Store Embeddings| ChromaDB
-MetadataWriter --> MongoDB
-TextExtractor -->|Save Raw Files| FileStorageWriter
-FileStorageWriter --> BlobStorage
-
-%% ---- Retrieval Flow ----
-ChatModule -->|User Query| QueryAPI
-QueryAPI --> QueryValidator
-QueryValidator --> QueryEmbedder
-QueryEmbedder -->|Generate Query Embedding| VectorRetriever
-VectorRetriever -->|Retrieve Top-K Matches| ResultRanker
-ResultRanker --> ContextAssembler
-ContextAssembler --> ContextCompressor
-ContextCompressor --> MetadataFetcher
-MetadataFetcher --> PromptTemplateManager
-PromptTemplateManager --> ContextEnhancer
-ContextEnhancer --> SafetyFilter
-SafetyFilter --> PromptComposer
-PromptComposer --> LLMInvoker
-LLMInvoker -->|Invoke LLM| LLM
-LLM -->|Generate Response| ResponseParser
-ResponseParser --> ResponseEnhancer
-ResponseEnhancer -->|Return Final Answer| ChatModule
-FeedbackHandler -->|User Ratings / Feedback| MongoDB
-MongoDB -->|Improve Ranking / Quality| ChromaDB
-```
+The application is divided into three main layers: the API layer, the pipeline layer, and the storage layer. See `architecture.md` for a detailed diagram and description of the pipelines.
 
 ### Ingestion Pipeline
 
@@ -147,6 +34,10 @@ The retrieval pipeline is responsible for answering user queries. It consists of
 7.  **LLM Invocation:** Invokes the LLM to generate a response.
 8.  **Response Enhancement:** Enhances the response by adding sources and other relevant information.
 
+### Feedback Pipeline
+
+The feedback pipeline is responsible for collecting user feedback on the quality of the retrieved documents.
+
 ## API Reference
 
 ### `POST /embed`
@@ -156,7 +47,7 @@ Uploads a document for processing and embedding.
 **Request:**
 
 ```bash
-curl -X POST -F "file=@/path/to/your/file.pdf" http://localhost:3000/embed
+curl -X POST -F "file=@/path/to/your/file.pdf" -H "session_id: <session_id>" http://localhost:3000/embed
 ```
 
 **Response:**
@@ -176,7 +67,7 @@ Answers a user's query based on the documents in the vector store.
 **Request:**
 
 ```bash
-curl -X POST -H "Content-Type: application/json" -d '{"query": "your query"}' http://localhost:3000/retrieve
+curl -X POST -H "Content-Type: application/json" -H "session_id: <session_id>" -d '{"query": "your query"}' http://localhost:3000/retrieve
 ```
 
 **Response:**
@@ -190,6 +81,26 @@ curl -X POST -H "Content-Type: application/json" -d '{"query": "your query"}' ht
       "doc_id": "..."
     }
   ]
+}
+```
+
+### `POST /api/v1/feedback`
+
+Submits feedback on a document.
+
+**Request:**
+
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"doc_id": "...", "rating": 1}' http://localhost:3000/api/v1/feedback
+```
+
+**Response:**
+
+```json
+{
+  "status": "success",
+  "doc_id": "...",
+  "rating": 1
 }
 ```
 

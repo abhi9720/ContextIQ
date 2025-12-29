@@ -29,11 +29,11 @@ def embed_and_store(text, metadata, chunk_id):
     vector_store.persist()
     logger.debug(f"Successfully persisted chunk with id: {chunk_id}")
 
-def retrieve(query, k=5):
+def retrieve(query, k=5, filter=None):
     """Retrieves the top k most similar documents to the given query."""
-    logger.info(f"Retrieving top {k} documents for query: '{query}'")
+    logger.info(f"Retrieving top {k} documents for query: '{query}' with filter: {filter}")
     # Retrieve the most similar documents to the query
-    results = vector_store.similarity_search_with_score(query, k=k)
+    results = vector_store.similarity_search_with_score(query, k=k, filter=filter)
     logger.debug(f"Raw retrieval results: {results}")
 
     # Format the results as a dictionary
