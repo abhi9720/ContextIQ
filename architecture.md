@@ -1,121 +1,108 @@
+# System Architecture
 
-# Application Architecture
+This document outlines the architecture of the system, including the main components and their interactions.
 
-This document outlines the architecture of the RAG application, detailing the ingestion, retrieval, and feedback pipelines.
+## Overview
+
+The system is designed as a web-based application that allows users to upload documents and generate quizzes and flashcards from them. The architecture is based on a client-server model, with a React-based front-end and a Python-based back-end.
+
+## Components
+
+- **Client:** A React-based single-page application that provides the user interface for uploading documents and viewing generated content.
+- **Server:** A Python-based back-end built with FastAPI that provides the API for managing documents, generating quizzes, and creating flashcards.
+- **Metadata Store:** A component that stores metadata about the documents, quizzes, and flashcards.
+- **Vector Store:** A component that stores vector representations of the document chunks.
+- **LLM:** A large language model that is used to generate quizzes and flashcards.
+
+## Data Flow
+
+1. The user uploads a document through the client.
+2. The client sends the document to the server.
+3. The server saves the document and creates a new document record in the metadata store.
+4. A background worker processes the document, extracts chunks, and stores them in the vector store.
+5. The user requests to generate a quiz or flashcards for the document.
+6. The server creates a new quiz or flashcard generation job in the metadata store.
+7. A background worker retrieves the document chunks from the vector store, generates a prompt, and sends it to the LLM.
+8. The LLM generates the quiz or flashcards and returns them to the server.
+9. The server saves the generated content in the metadata store and updates the job status.
+10. The client polls the server for the job status and displays the generated content when it is ready.
 
 ## Mermaid Diagram
 
 ```mermaid
---- 
-config: 
-  theme: base
-  layout: fixed
---- 
-flowchart TD
-
-%% ======================= CLIENT LAYER =======================
-subgraph CLIENT["🧑‍💻 Client Applications"]
-  WebApp["Web / Mobile / Admin UI"]
-  UploadModule["Document Upload / Sync Module"]
-  ChatModule["Chat + Search Interface"]
-  Dashboard["Admin Dashboard (Monitor & Manage Docs)"]
-end
-
-%% ======================= BACKEND LAYER =======================
-subgraph BACKEND["🌐 Backend API (FastAPI / Flask)"]
-
-  %% -------- DOCUMENT INGESTION PIPELINE --------
-  subgraph INGESTION["📥 Document Ingestion Pipeline"]
-    FileUploadAPI["POST /embed → Upload Document"]
-    FileValidator["Validator → Type, Size, Integrity"]
-    SourceRouter["Source Router → File / URL / API / Stream"]
-    TextExtractor["Text Extractor → PDF, DOCX, HTML, Email"]
-    TextPreprocessor["Text Preprocessor → Cleanup, Normalize, Lemmatize"]
-    Chunker["Chunker → Token / Paragraph Split + Overlap"]
-    MetadataGenerator["Metadata Generator → Title, Author, Tags"]
-    EmbeddingClient["Embedding Model Client → SentenceTransformer / OpenAI"]
-    ChromaWriter["Chroma Client → Upsert Vectors + Metadata"]
-    MetadataWriter["Metadata Writer → MongoDB / Postgres"]
-    FileStorageWriter["Blob Storage Writer → S3 / NFS / Local Disk"]
-  end
-
-  %% -------- RETRIEVAL PIPELINE --------
-  subgraph RETRIEVAL["🔍 Retrieval & Query Pipeline"]
-    QueryAPI["POST /retrieve → Semantic Search"]
-    QueryValidator["Query Validator → Length, Language, Safety"]
-    QueryEmbedder["Query Embedder → Same Model as Document Embeddings"]
-    VectorRetriever["Vector Search → Chroma (Cosine Similarity)"]
-    ResultRanker["Re-ranker → Cross-Encoder / BGE / Score Normalizer"]
-    ContextAssembler["Context Assembler → Merge + Deduplicate"]
-    ContextCompressor["Context Compressor → Token Optimization"]
-    MetadataFetcher["Metadata Fetcher → Title, Source, Timestamp"]
-  end
-
-  %% -------- LLM ORCHESTRATION --------
-  subgraph LLM_FLOW["🧠 LLM Orchestration & Response Generation"]
-    PromptTemplateManager["Prompt Template Manager → Q&A / Summary / Search"]
-    ContextEnhancer["Context Enhancer → Add Metadata + Highlights"]
-    SafetyFilter["Safety Filter → Sensitive Data Masking"]
-    PromptComposer["Prompt Composer → Build Final System + User Prompt"]
-    LLMInvoker["LLM Connector → Gemini / GPT / Claude"]
-    ResponseParser["Response Parser → Structured / Plain Text"]
-    ResponseEnhancer["Response Enhancer → Formatting + Source Linking"]
-    FeedbackHandler["Feedback Collector → User Ratings + Corrections"]
-  end
-end
-
-%% ======================= STORAGE LAYER =======================
-subgraph STORAGE["🗂️ Storage & Database Layer"]
-  ChromaDB["ChromaDB → Vector Store"]
-  MongoDB["MongoDB / Postgres → Metadata + User Data"]
-  BlobStorage["S3 / NFS / Local Disk → Raw Documents"]
-end
-
-%% ======================= MODEL LAYER =======================
-subgraph MODEL["🤖 Models"]
-  EmbedModel["Embedding Model → text-embedding-3-small / all-MiniLM-L6-v2"]
-  LLM["LLM → Gemini / GPT-4 / Claude"]
-end
-
-
-%% ======================= DATA FLOWS =======================
-
-%% ---- Ingestion Flow ----
-WebApp -->|Uploads / Syncs Documents| UploadModule
-UploadModule --> FileUploadAPI
-FileUploadAPI --> FileValidator
-FileValidator --> SourceRouter
-SourceRouter --> TextExtractor
-TextExtractor --> TextPreprocessor
-TextPreprocessor --> Chunker
-Chunker --> MetadataGenerator
-MetadataGenerator --> EmbeddingClient
-EmbeddingClient -->|Generate Vector Embeddings| ChromaWriter
-ChromaWriter -->|Store Embeddings| ChromaDB
-MetadataWriter --> MongoDB
-TextExtractor -->|Save Raw Files| FileStorageWriter
-FileStorageWriter --> BlobStorage
-
-%% ---- Retrieval Flow ----
-ChatModule -->|User Query| QueryAPI
-QueryAPI --> QueryValidator
-QueryValidator --> QueryEmbedder
-QueryEmbedder -->|Generate Query Embedding| VectorRetriever
-VectorRetriever -->|Retrieve Top-K Matches| ResultRanker
-ResultRanker --> ContextAssembler
-ContextAssembler --> ContextCompressor
-ContextCompressor --> MetadataFetcher
-MetadataFetcher --> PromptTemplateManager
-PromptTemplateManager --> ContextEnhancer
-ContextEnhancer --> SafetyFilter
-SafetyFilter --> PromptComposer
-PromptComposer --> LLMInvoker
-LLMInvoker -->|Invoke LLM| LLM
-LLM -->|Generate Response| ResponseParser
-ResponseParser --> ResponseEnhancer
-ResponseEnhancer -->|Return Final Answer| ChatModule
-FeedbackHandler -->|User Ratings / Feedback| MongoDB
-MongoDB -->|Improve Ranking / Quality| ChromaDB
+graph TD
+    %% Styling definitions with LLM as central intelligence
+    classDef userNode fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#01579b
+    classDef serverNode fill:#f3e5f5,stroke:#4a148c,stroke-width:2px,color:#4a148c
+    classDef dataNode fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px,color:#1b5e20
+    classDef llmCoreNode fill:#fff3e0,stroke:#FF6B00,stroke-width:3px,color:#D84315,font-weight:bold
+    classDef intelligenceNode fill:#fff8e1,stroke:#FF8F00,stroke-width:2.5px,color:#E65100
+    
+    %% Main nodes
+    A[📱 Client]:::userNode
+    
+    subgraph "RAG Server" 
+        B[🌐 API Gateway]:::serverNode
+        
+        subgraph "Processing Pipeline"
+            C[📥 Ingestion Pipeline]:::serverNode
+            D[🔍 Retrieval Pipeline]:::serverNode
+            E[📝 Quiz & Flashcard Generator]:::serverNode
+        end
+        
+        subgraph "Core Intelligence"
+            H[🤖 LLM Engine]:::llmCoreNode
+        end
+    end
+    
+    subgraph "Data Layer"
+        F[🗃️ Metadata Store]:::dataNode
+        G[🧠 Vector Store]:::dataNode
+    end
+    
+    %% Document upload flow
+    A -- "📤 Upload Document" --> B
+    B -- "⚙️ Process Document" --> C
+    C -- "💾 Store Metadata" --> F
+    C -- "🧬 Generate & Store Embeddings" --> G
+    
+    %% Quiz/Flashcard generation flow - LLM as central component
+    A -- "❓ Request Quiz/Flashcards" --> B
+    B -- "🚀 Initiate Generation" --> E
+    E -- "📚 Retrieve Relevant Chunks" --> G
+    E -- "🤔 Query LLM for Generation" --> H
+    H -- "✨ Generate Intelligent Content" --> E
+    E -- "💾 Save Generated Content" --> F
+    
+    %% Polling and response
+    A -- "🔄 Poll for Result" --> B
+    B -- "📄 Return Generated Content" --> A
+    
+    %% Query processing flow - LLM as reasoning engine
+    A -- "🔍 Submit Query" --> B
+    B -- "🔄 Process Query" --> D
+    D -- "📊 Retrieve Relevant Chunks" --> G
+    D -- "🧠 Augment with Context" --> H
+    H -- "💡 Generate Intelligent Response" --> D
+    D -- "📤 Return Enhanced Answer" --> B
+    B -- "🎯 Return Intelligent Answer" --> A
+    
+    %% Special emphasis on LLM connections
+    linkStyle 9 stroke:#FF6B00,stroke-width:3px
+    linkStyle 10 stroke:#FF6B00,stroke-width:3px
+    linkStyle 15 stroke:#FF6B00,stroke-width:3px
+    linkStyle 16 stroke:#FF6B00,stroke-width:3px
+    
+    %% Additional styling for clarity
+    style H fill:#fff3e0,stroke:#FF6B00,stroke-width:3px,color:#D84315,font-weight:bold
+    
+    %% Legend box
+    subgraph "Legend"
+        L1[📱 Client Interaction]:::userNode
+        L2[⚙️ Server Processing]:::serverNode
+        L3[🤖 LLM Intelligence]:::llmCoreNode
+        L4[💾 Data Storage]:::dataNode
+    end
 ```
 
 ## Detailed Flow Descriptions
