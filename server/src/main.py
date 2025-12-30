@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List
 
@@ -28,6 +29,21 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Add CORS middleware
+origins = [
+    "http://localhost:3000",  # React app
+    "http://localhost:8080",  # Or another port if your React app runs elsewhere
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 metadata_store = MetadataStore()
 
 # Background executor for processing-intensive tasks
@@ -308,7 +324,7 @@ async def upload_document(
 ):
     ingestion_validator.validate_file(file)
     
-    upload_dir = "uploads"
+    upload_dir = "server/uploads"
     os.makedirs(upload_dir, exist_ok=True)
     
     doc_id = str(uuid.uuid4())
@@ -322,7 +338,7 @@ async def upload_document(
     logger.info(f"Document {doc_id} uploaded. Worker will pick it up for processing.")
     return {"doc_id": doc_id, "status": "UPLOADED"}
 
-@app.post("/documents/{doc_id}/quiz", response_model=QuizCreateResponse)
+@app.post("/documents/{doc_id}/quiz", response_model=QuizCreate.py)
 def create_quiz_job(
     doc_id: str,
     request: QuizRequest,

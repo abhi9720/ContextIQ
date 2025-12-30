@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = "all-MiniLM-L6-v2"
 
 # The directory to store the vector database
-PERSIST_DIRECTORY = os.environ.get('PERSIST_DIRECTORY', 'db')
+PERSIST_DIRECTORY = os.environ.get('PERSIST_DIRECTORY', 'server/db')
 
 # Create the embedding function
 embedding_function = SentenceTransformerEmbeddings(model_name=MODEL_NAME)
